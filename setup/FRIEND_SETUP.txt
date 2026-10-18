@@ -1,0 +1,133 @@
+NZ Direct: play Black Ops III Zombies online with friends
+=========================================================
+
+NZ Direct is a modified boiii (Ezz boiii-free) that boots straight into a
+Zombies match, plus a launcher with online lobbies, friends, Gobblegum packs
+and match history. Everyone in a lobby needs this same setup.
+
+What you need
+  - Black Ops III installed from Steam (the Zombies maps you want to play).
+  - Windows 10/11 and about 110 MB free on the drive the game is on.
+  - No Python needed: the launcher is NZDirect.exe.
+
+Your Steam install is never changed
+  Setup makes a separate folder (default <game drive>:\BO3Direct). The game
+  files are linked from Steam (hard links and folder links), so they take no
+  extra space; only small config files are copied. The special BlackOps3.exe
+  that boiii needs goes into the new folder only. Setup checks the Steam folder
+  before and after and stops if anything there would change.
+  To remove NZ Direct: delete the BO3Direct folder and the desktop shortcut.
+
+
+1. Install (once)
+-----------------
+  1. Extract the whole zip somewhere (for example your Downloads folder).
+  2. Double-click "Setup NZ Direct.cmd".
+     - It finds Black Ops III in Steam and asks for a folder (press Enter for
+       the default). The folder must be on the same drive as the game.
+     - It downloads the BlackOps3.exe version boiii supports (about 101 MB)
+       from boiii's own source on archive.org and checks its SHA-1
+       (9D03F81086112113BFB1DD22B8538B9398AC3B9B). If you already have that
+       file, run:  setup_nzdirect.ps1 -ExeSource <path to it>
+     - It makes a desktop shortcut "NZ Direct".
+     Want to see first what it would do?  Open PowerShell in the kit folder:
+         powershell -ExecutionPolicy Bypass -File .\setup_nzdirect.ps1 -DryRun
+  3. Windows SmartScreen may warn about NZDirect.exe the first time (it is not
+     a signed program): click "More info" > "Run anyway".
+
+After a Black Ops III update on Steam, run "Setup NZ Direct.cmd" again; it
+refreshes the links and keeps everything else.
+
+
+2. First start
+--------------
+  1. Start "NZ Direct" from the desktop.
+  2. Friends tab: type a username and click Save (it is also your in-game name).
+  3. Online lobby tab: click "Set up online play". This installs ZeroTier
+     (a free, encrypted private virtual LAN) and adds two Windows Firewall
+     rules that only accept lobby players. Windows asks for administrator
+     permission once.
+
+
+3. Playing together
+-------------------
+  Host:
+    1. Play tab: pick the map (and mod, if any).
+    2. Online lobby tab: "Create lobby". You get a code like 7ZQK-M2PA-XB91C
+       (already copied); send it to your friends.
+    3. Friends join automatically. Anyone who is not your friend yet shows as
+       "wants to join": select them and click "Let in" (or "Decline / kick").
+    4. When everyone shows "in lobby", click "Start match". The match waits at
+       its start until all of them are in.
+  Joining:
+    1. Online lobby tab: paste the code, click Join.
+    2. Wait for the host to let you in; the game starts by itself when the
+       host starts the match.
+  When a match ends the game closes and you are back in the launcher, still in
+  the lobby, ready for the next one.
+
+  The host's map and mod must be installed on your PC too (for Workshop maps
+  and mods: subscribe to the same item on the Steam Workshop).
+
+
+4. Friends
+----------
+  Friends tab > "Your friend ID" looks like  name#1a2b3c4d5e. Add a friend by
+  pasting their friend ID, or by just their username once you have played in
+  a lobby together (they appear under "Recent players"; double-click to add).
+  Friends get into your lobbies without you having to let them in.
+
+  Why the #id: there is no NZ Direct server that could look names up. The id
+  is your PC's ZeroTier address; it comes from a private key on your PC, so
+  nobody can pretend to be your friend.
+
+
+5. Gobblegums
+-------------
+  Gobblegums tab: pick up to 5 gums and tick "Use this pack". Every match
+  started from the launcher (solo, hosting or joining) puts them into your
+  equipped pack, as if you had changed it in the game's own pack menu: the
+  scoreboard (hold Tab), the GobbleGum machines and mods such as All-around
+  Enhancement all use it. Untick it to leave the game's pack as it is.
+
+
+Security, in short
+------------------
+  - No IP addresses are shared and no router ports are opened.
+  - A lobby is a private ZeroTier network that the host's own PC controls.
+    The code only lets a PC ask to join; the host's launcher lets in friends
+    and asks the host about everyone else. Traffic is end-to-end encrypted.
+    The network is deleted when the host closes the lobby.
+  - The firewall rules only accept the game (UDP 27017) and the lobby
+    (TCP 27018) from lobby addresses (10.244.0.0/14).
+
+
+Troubleshooting
+---------------
+  "Your ZeroTier version can't run lobbies by itself"
+      ZeroTier 1.16 and newer have no built-in lobby controller. Either
+      uninstall ZeroTier (Windows Settings > Apps) and click "Set up online
+      play" again (installs 1.14.2), or paste an API token from a free
+      my.zerotier.com account when the launcher asks. Joining works with any
+      version.
+  Stuck on "Waiting for the host to let you in"
+      The host has to select you and click "Let in".
+  "The host's game didn't answer"
+      The host's game is still loading, or a firewall is blocking it: the
+      host can click "Set up online play" again (it rewrites the rules).
+  Other problems
+      boiii_direct_launch.log in the game folder
+      (<folder>\steamapps\common\Call of Duty Black Ops III) shows what the
+      game did.
+
+Fallback without the built-in lobbies (not recommended)
+  Only if ZeroTier can't be used at all. The host either forwards UDP port
+  27017 on their router to their PC, or everyone joins another virtual LAN
+  (Radmin VPN, or a ZeroTier network you run yourselves) and uses that
+  address. This shares the host's IP address and skips the lobby's
+  let-in check.
+    Host:  Play tab, Extra args:  +set sv_maxclients 4 +set lobby_min_players 2
+           (2 = number of players including the host), then "Play solo".
+    Others: in the game folder (<folder>\steamapps\common\Call of Duty Black Ops III)
+           run:  boiii.exe -launch -noupdate +set direct_exit 1 +connect <host address>:27017
+  Gobblegum packs only apply to the host this way.

@@ -1,0 +1,640 @@
+diff --git a/src/client/component/client_command.cpp b/src/client/component/client_command.cpp
+index aeafcf66..3bd2c463 100644
+--- a/src/client/component/client_command.cpp
++++ b/src/client/component/client_command.cpp
+@@ -43,6 +43,14 @@ class component final : public generic_component {
+ 
+ public:
+   void post_unpack() override {
++    // ClientCommand checks its return address (Arxan): called from the
++    // detour's trampoline it can spin forever, stalling the local server
++    // (EXE_ERR_SERVER_TIMEOUT). The chat handlers are only useful online, so a
++    // direct-launch (solo) session leaves the function alone.
++    if (strstr(GetCommandLineA(), "direct_map")) {
++      return;
++    }
++
+     ClientCommand_hook.create(game::ClientCommand,
+                               ClientCommand_ExecuteRegistered);
+   }
+diff --git a/src/client/component/com.cpp b/src/client/component/com.cpp
+index 57f40f02..08145c3f 100644
+--- a/src/client/component/com.cpp
++++ b/src/client/component/com.cpp
+@@ -3,6 +3,8 @@
+ #include <game/game.hpp>
+ #include <loader/component_loader.hpp>
+ 
++#include "direct_launch.hpp"
++
+ #include "com.hpp"
+ 
+ #include <utils/concurrency.hpp>
+@@ -60,7 +62,28 @@ void DB_LoadXAssets_stub(game::db::xzone::XZoneInfo *zoneInfo,
+     is_level_fastfile_unload = zoneInfo->name == nullptr &&
+                                alloc_flags_include_level_zone && zoneCount == 1;
+   }
+-  DB_LoadXAssets_hook.invoke(zoneInfo, zoneCount, sync, suppressSync);
++  const auto skipped = [&](const uint32_t i) {
++    return zoneInfo[i].name && direct_launch::skip_zone(zoneInfo[i].name);
++  };
++  std::vector<game::db::xzone::XZoneInfo> kept;
++  bool filtered = false;
++  for (uint32_t i = 0; zoneInfo && i < zoneCount; ++i) {
++    filtered |= skipped(i);
++  }
++  if (filtered) {
++    for (uint32_t i = 0; i < zoneCount; ++i) {
++      if (!skipped(i)) {
++        kept.push_back(zoneInfo[i]);
++      }
++    }
++    if (kept.empty()) {
++      return;
++    }
++  }
++  DB_LoadXAssets_hook.invoke(
++      filtered ? kept.data() : zoneInfo,
++      filtered ? static_cast<uint32_t>(kept.size()) : zoneCount, sync,
++      suppressSync);
+   if (is_level_fastfile_unload) {
+     const char *level = *game::g_mapname;
+     if (level[0]) {
+diff --git a/src/client/component/patches.cpp b/src/client/component/patches.cpp
+index 93265e4b..a0001e72 100644
+--- a/src/client/component/patches.cpp
++++ b/src/client/component/patches.cpp
+@@ -1,5 +1,6 @@
+ #include <std_include.hpp>
+ 
++#include "direct_launch.hpp"
+ #include "component/path.hpp"
+ #include "scheduler.hpp"
+ #include <loader/component_loader.hpp>
+@@ -160,6 +161,7 @@ void com_error_stub(const char *file, int32_t line, game::errorParm code,
+       game::derelocate(callerAddr), msg, static_cast<int32_t>(code));
+   fprintf(stderr, "%s\n", log);
+   fflush(stderr);
++  direct_launch::on_com_error(msg);
+   game::trace("{}", log);
+   game::com::Com_Printf(game::consoleChannel_e::CHANNEL_DONT_FILTER,
+                         game::consoleLabel_e::DEFAULT, "%s\n", log);
+diff --git a/src/client/component/direct_launch.cpp b/src/client/component/direct_launch.cpp
+new file mode 100644
+index 00000000..1dba2d5a
+--- /dev/null
++++ b/src/client/component/direct_launch.cpp
+@@ -0,0 +1,482 @@
++#include <std_include.hpp>
++
++#include "command.hpp"
++#include "console.hpp"
++#include "direct_launch.hpp"
++#include "scheduler.hpp"
++#include <game/game.hpp>
++#include <game/utils.hpp>
++#include <game/impl/ugc/ugc.hpp>
++#include <loader/component_loader.hpp>
++
++#include <utils/hook.hpp>
++#include <utils/string.hpp>
++
++/*
++  Direct launch: boot straight into a solo Zombies match.
++
++    boiii.exe -launch +set direct_map zm_castle
++    boiii.exe -launch +set direct_map zm_leviathan [+set direct_mod usermaps]
++    boiii.exe -launch +set direct_map zm_castle +set direct_mod 2631943123
++
++  At the end of Com_Init the engine's boot routine calls Com_StartFrontEnd(),
++  which spawns the frontend level as a local server
++  (SV_SpawnServer(controller, "core_frontend", ...)) while the session mode
++  is still INVALID, and then opens the title screen menu.
++
++  With direct_map set, the boot-time Com_StartFrontEnd is replaced by what a
++  Zombies lobby does when it launches a match:
++    - offline network mode and Com_SwitchMode to ZOMBIES (loads zm_patch / zm_common),
++    - mount the mod (UGC_LoadMod; a gameplay mod restarts the filesystem),
++    - leave the UI level (the relevant part of Com_ShutdownUILevel),
++    - run the engine's `map` command.
++  The title screen menu that the boot routine opens afterwards is skipped.
++  core_frontend, the title screen and the Zombies menus are never loaded.
++
++  +set direct_exit 1 closes the game when the match ends (or the player
++  leaves it) instead of opening the title screen, e.g. to return to a
++  launcher. It also works without direct_map for a player who joins a
++  friend with +connect <address>.
++
++  Hosting for friends: +set sv_maxclients <n> +set lobby_min_players <n>
++  makes the match wait at its start until n players are in.
++
++  +set direct_log 1 mirrors the console to <game>/boiii_direct_launch.log
++  (or +set direct_log <file name> for another file in the game folder)
++  with timestamps measured from process start.
++*/
++
++namespace direct_launch {
++namespace {
++std::string direct_map;
++std::string bgb_pack;
++std::string direct_mod;
++bool log_to_file = false;
++std::string log_file_name = "boiii_direct_launch.log";
++bool exit_after_match = false;
++
++// Com_StartFrontEnd: spawns "core_frontend" as a local server.
++constexpr uintptr_t COM_START_FRONTEND = 0x1420EFD10;
++
++// In the boot routine (0x1420EF960), after Com_StartFrontEnd and the logo
++// movie: require "ui_mp.T6.main" and LUI addmenu "main" (the title screen).
++// The instruction at the end calls Lobby_Init, which still runs.
++constexpr uintptr_t FRONTEND_MAIN_MENU_BEGIN = 0x1420EFA28;
++constexpr uintptr_t FRONTEND_MAIN_MENU_END = 0x1420EFA61;
++
++// Read by Com_IsRunningUILevel; cleared by Com_ShutdownUILevel.
++constexpr uintptr_t COM_UI_LEVEL_RUNNING = 0x15686E99E;
++
++// CL_ShutdownUI: if the client UI is started, shut it down and clear
++// clientStatic's "UI started" flag.
++constexpr uintptr_t CL_SHUTDOWN_UI = 0x1413E3310;
++
++// Registers the screenshot commands and allocates the frontend screenshot
++// buffers (PMem "UI_FrontendScreenshot", "UI_FrontendJpgThumbnail"); the last
++// step of the boot routine.
++constexpr uintptr_t UI_INIT_FRONTEND_SCREENSHOT = 0x14223BCC0;
++
++// UGC mod load state: 1 loading, 2 loaded (finishing), 0 done.
++constexpr uintptr_t UGC_MOD_LOAD_STATE = 0x15670E1E8;
++
++utils::hook::detour start_frontend_hook;
++utils::hook::detour init_screenshot_hook;
++bool hold_screenshot_init = false;
++
++// PMem is a stack: whatever is allocated before the map can only be freed
++// after it. Without a mod the boot routine allocates the screenshot buffers
++// after the map (it spawns inside Com_StartFrontEnd). With a mod the map is
++// launched later, so hold the allocation back until the map is up.
++void init_screenshot_stub() {
++  if (hold_screenshot_init) {
++    return;
++  }
++  init_screenshot_hook.invoke<void>();
++}
++
++double seconds_since_process_start() {
++  FILETIME creation{}, exit{}, kernel{}, user{}, now{};
++  GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user);
++  GetSystemTimeAsFileTime(&now);
++  const auto to_u64 = [](const FILETIME &ft) {
++    return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
++  };
++  return static_cast<double>(to_u64(now) - to_u64(creation)) / 1e7;
++}
++
++void write_log_file(const std::string &msg) {
++  static std::mutex mutex;
++  std::lock_guard _(mutex);
++
++  const auto path = game::game_directory() / log_file_name;
++  FILE *f{};
++  if (fopen_s(&f, path.string().data(), "ab") == 0 && f) {
++    fprintf(f, "[%8.3f] %s", seconds_since_process_start(), msg.data());
++    if (msg.empty() || msg.back() != '\n') {
++      fputc('\n', f);
++    }
++    fclose(f);
++  }
++}
++
++void print(const std::string &msg) {
++  printf("[direct_launch] %.3fs: %s\n", seconds_since_process_start(),
++         msg.data());
++}
++
++// Reads `+set <name> <value>` from the process command line; the values are
++// needed before the engine has registered them as dvars.
++std::string get_command_line_set(const std::string &name) {
++  int argc = 0;
++  const auto argv = CommandLineToArgvW(GetCommandLineW(), &argc);
++  if (!argv) {
++    return {};
++  }
++
++  std::string result;
++  for (int i = 0; i + 2 < argc; ++i) {
++    if (_wcsicmp(argv[i], L"+set") == 0 &&
++        utils::string::convert(argv[i + 1]) == name) {
++      result = utils::string::convert(argv[i + 2]);
++    }
++  }
++
++  LocalFree(argv);
++  return result;
++}
++
++bool is_usermap(const std::string &map) {
++  for (uint32_t i = 0; i < game::ugc::usermapsPool.count; ++i) {
++    const auto &data = game::ugc::usermapsPool.data[i];
++    if (map == data.internalName || map == data.publisherId) {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool map_exists(const std::string &map) {
++  return is_usermap(map) || std::filesystem::exists(game::game_directory() /
++                                                    "zone" / (map + ".ff"));
++}
++
++// Resolves a mod given by Workshop ID or folder name to its publisher ID.
++std::string find_mod_publisher_id(const std::string &mod) {
++  game::ugc::UGC_LoadModsPool_Impl();
++  for (uint32_t i = 0; i < game::ugc::modsPool.count; ++i) {
++    const auto &data = game::ugc::modsPool.data[i];
++    if (mod == data.internalName || mod == data.publisherId) {
++      return data.publisherId;
++    }
++  }
++  return {};
++}
++
++// The mode switch the Zombies menu performs; flag 2 loads the mode's common
++// fastfiles (zm_patch, zm_common) right away.
++//
++// At boot the session's network mode is still INVALID (the title screen sets
++// it). Switching modes in that state leaves the match's local server
++// starving a few seconds in ("Connection Interrupted", then
++// EXE_ERR_SERVER_TIMEOUT), so go offline first, as the menu's "Play
++// Offline" does. SV_SpawnServer later sets the mode it needs itself.
++void switch_to_zombies() {
++  game::com::Com_SessionMode_SetNetworkMode(game::eNetworkModes::OFFLINE);
++
++  const auto mode = game::com::Com_SessionMode_GetMode();
++  if (mode != game::eModes::ZOMBIES) {
++    game::com::Com_SwitchMode(game::LOCAL_CLIENT_0, mode,
++                              game::eModes::ZOMBIES, 6);
++  }
++}
++
++// Reports when the local client is active: connected, first snapshot
++// received and the level rendering (Zombies' intro fade-in follows).
++void watch_for_client_active() {
++  static std::atomic<bool> watching{false};
++  if (watching.exchange(true)) {
++    return;
++  }
++  scheduler::schedule(
++      [] {
++        if (game::cg::clientUIActives->actives[0].connectionState !=
++            game::connstate_t::ACTIVE) {
++          return scheduler::cond_continue;
++        }
++        // A joiner is first active in its own frontend; wait for the match.
++        const auto map = game::get_mapname();
++        if (!map || map->empty() || *map == "core_frontend") {
++          return scheduler::cond_continue;
++        }
++        print("client active");
++        watching = false;
++        return scheduler::cond_end;
++      },
++      scheduler::pipeline::main);
++}
++
++// Until the first match starts, the boot loads only what Zombies needs.
++std::atomic<bool> booting{true};
++
++void launch_map() {
++  booting = false;
++  switch_to_zombies();
++
++  // What Com_ShutdownUILevel does for the lobby before it launches a match,
++  // minus its server/renderer teardown, which has nothing to act on here:
++  //  - clear "UI level running", otherwise the bsp is looked up under
++  //    maps/core/ instead of maps/zm/,
++  //  - CL_ShutdownUI, so the in-game UI and its roots are created when the
++  //    level loads. Only matters after a mod's filesystem restart, which
++  //    brings the frontend UI up; otherwise the UI was never started.
++  *reinterpret_cast<uint8_t *>(game::relocate(COM_UI_LEVEL_RUNNING)) = 0;
++  utils::hook::invoke<int>(game::relocate(CL_SHUTDOWN_UI));
++
++  // Custom maps need the "usermaps" pseudo-mod. It mounts without a
++  // filesystem restart.
++  if (direct_mod.empty() && is_usermap(direct_map)) {
++    direct_mod = "usermaps";
++  }
++  if (direct_mod == "usermaps") {
++    game::ugc::UGC_LoadModByPublisherId_Impl(game::LOCAL_CLIENT_0, "usermaps",
++                                             false);
++  }
++
++  print(utils::string::va("map %s, mod '%s', session mode %d",
++                          direct_map.data(),
++                          game::ugc::UGC_ActiveMod_PublisherId(),
++                          static_cast<int>(
++                              game::com::Com_SessionMode_GetMode())));
++
++  // The engine's `map` command, run where the frontend would have been
++  // spawned, so the level and its UI exist when Com_Init continues.
++  game::cbuf::Cbuf_ExecuteBuffer(
++      game::LOCAL_CLIENT_0, game::CONTROLLER_INDEX_FIRST,
++      utils::string::va("map %s\n", direct_map.data()));
++
++  print("map spawned");
++  watch_for_client_active();
++}
++
++// Second half of a mod launch, run from the console buffer once the mod
++// load has completed.
++void launch_after_mod_load() {
++  launch_map();
++  hold_screenshot_init = false;
++  utils::hook::invoke<void>(game::relocate(UI_INIT_FRONTEND_SCREENSHOT));
++}
++
++// A clientfield mismatch (client and server scripts registered different
++// clientfields) drops the player at connect. Seen with some mods on heavy
++// maps (e.g. All-around Enhancement on Origins) and it doesn't repeat
++// reliably, so the launch is simply retried.
++constexpr int MAX_RELAUNCHES = 2;
++std::atomic<bool> relaunch_pending{false};
++int relaunches = 0;
++
++// The launcher's Gobblegum pack (+set nzd_bgb gum,gum,...) for
++// boiii/ui_scripts/nzdirect_bgb. Lua only sees registered dvars (a +set of an
++// unknown dvar is not one). Registered when the frontend starts, before its
++// Lua loads; too early in post_unpack.
++void register_bgb_dvar() {
++  static bool done = false;
++  if (done || bgb_pack.empty()) {
++    return;
++  }
++  done = true;
++  game::register_dvar_string("nzd_bgb", bgb_pack.data(), game::DVAR_NONE,
++                             "NZ Direct Gobblegum pack");
++}
++
++void start_frontend_stub() {
++  register_bgb_dvar();
++  static bool launched = false;
++  static bool loading_mod = false;
++
++  // UGC_LoadMod's filesystem restart re-runs the boot routine. Spawn nothing;
++  // the map is launched once the mod has loaded.
++  if (loading_mod) {
++    return;
++  }
++
++  // Only the boot-time frontend is replaced. When the match ends the engine
++  // calls Com_StartFrontEnd again and the normal frontend loads. The title
++  // menu is opened by the boot routine (the part skipped at boot), so open it
++  // here the first time, the same way boiii's UI reload does.
++  if (launched && relaunch_pending.exchange(false)) {
++    ++relaunches;
++    print(utils::string::va("relaunching after a clientfield mismatch (%d/%d)",
++                            relaunches, MAX_RELAUNCHES));
++    launch_map();
++    return;
++  }
++
++  if (launched && exit_after_match) {
++    print("match over, closing the game");
++    game::cbuf::Cbuf_AddText(game::LOCAL_CLIENT_0, "quit\n");
++    return;
++  }
++
++  if (launched) {
++    static bool title_menu_opened = false;
++    start_frontend_hook.invoke<void>();
++    if (!title_menu_opened && *game::lua::hks::primary_luaVM) {
++      title_menu_opened = true;
++      game::lua::cod::Lua_CoD_LoadLuaFile(*game::lua::hks::primary_luaVM,
++                                          "ui_mp.T6.main");
++      game::ui::UI_AddMenu(game::ui::UI_CoD_GetRootNameForController(
++                               game::com::Com_ControllerIndexes_GetPrimary()),
++                           "main", -1, *game::lua::hks::primary_luaVM);
++    }
++    return;
++  }
++
++  launched = true;
++
++  if (!map_exists(direct_map)) {
++    print(utils::string::va("map '%s' not found, loading the menus",
++                            direct_map.data()));
++    start_frontend_hook.invoke<void>();
++    return;
++  }
++
++  utils::hook::jump(game::relocate(FRONTEND_MAIN_MENU_BEGIN),
++                    game::relocate(FRONTEND_MAIN_MENU_END));
++
++  // A gameplay mod needs a filesystem restart, which UGC_LoadMod performs
++  // synchronously (all zones are reloaded).
++  if (!direct_mod.empty() && direct_mod != "usermaps") {
++    const std::string publisher_id = find_mod_publisher_id(direct_mod);
++    if (publisher_id.empty()) {
++      print(utils::string::va("mod '%s' is not installed, launching without it",
++                              direct_mod.data()));
++      direct_mod.clear();
++    } else if (publisher_id != game::ugc::UGC_ActiveMod_PublisherId()) {
++      direct_mod = publisher_id;
++
++      // Enter Zombies first: a mod's UI scripts expect the session mode to
++      // be set when they run.
++      switch_to_zombies();
++
++      print(utils::string::va("loading mod %s", direct_mod.data()));
++      hold_screenshot_init = true;
++      loading_mod = true;
++      game::ugc::UGC_LoadModByPublisherId_Impl(game::LOCAL_CLIENT_0,
++                                               direct_mod.data(), true);
++      loading_mod = false;
++
++      // The mod load finishes on the following frames (the mod's player
++      // data, then "ModLoad done"), normally while the player is still in
++      // the menus. Starting the map before that races it: client and server
++      // can end up with different clientfield registrations ("Clientfield
++      // Mismatch"). So let Com_Init finish and launch from the main loop
++      // once the load is complete.
++      scheduler::schedule(
++          [] {
++            if (*reinterpret_cast<volatile int32_t *>(
++                    game::relocate(UGC_MOD_LOAD_STATE)) != 0) {
++              return scheduler::cond_continue;
++            }
++            // Run the launch on the main thread, between frames.
++            game::cbuf::Cbuf_AddText(game::LOCAL_CLIENT_0,
++                                     "direct_launch_start\n");
++            return scheduler::cond_end;
++          },
++          scheduler::pipeline::async, 50ms);
++      return;
++    }
++  }
++
++  launch_map();
++}
++
++// A player joining a friend (+connect, no direct_map): the boot frontend is
++// the normal one; with direct_exit the next frontend, after the match, closes
++// the game instead.
++void joiner_frontend_stub() {
++  register_bgb_dvar();
++  static int calls = 0;
++  if (++calls > 1) {
++    print("left the match, closing the game");
++    game::cbuf::Cbuf_AddText(game::LOCAL_CLIENT_0, "quit\n");
++    return;
++  }
++  start_frontend_hook.invoke<void>();
++}
++
++} // namespace
++
++bool skip_zone(const char *name) {
++  if (direct_map.empty() || !booting) {
++    return false;
++  }
++  // "core_specialists" and its localized "<lang>_core_specialists".
++  const std::string_view zone = name;
++  constexpr std::string_view suffix = "core_specialists";
++  return zone.size() >= suffix.size() &&
++         zone.substr(zone.size() - suffix.size()) == suffix &&
++         (zone.size() == suffix.size() || zone[zone.size() - suffix.size() - 1] == '_');
++}
++
++void on_com_error(const char *message) {
++  if (!direct_map.empty() && message &&
++      strstr(message, "Clientfield Mismatch") && relaunches < MAX_RELAUNCHES) {
++    relaunch_pending = true;
++  }
++}
++
++class component final : public client_component {
++#ifndef NDEBUG
++  std::string name() override { return "direct_launch"; }
++#endif
++
++public:
++  void post_unpack() override {
++    direct_map = get_command_line_set("direct_map");
++    direct_mod = get_command_line_set("direct_mod");
++    // "1" for the default log name, or a file name (e.g. a second instance).
++    const std::string log_setting = get_command_line_set("direct_log");
++    log_to_file = !log_setting.empty() && log_setting != "0";
++    if (log_to_file && log_setting != "1" &&
++        log_setting.find_first_of("/\\:") == std::string::npos) {
++      log_file_name = log_setting;
++    }
++    exit_after_match = get_command_line_set("direct_exit") == "1";
++
++    if (log_to_file) {
++      console::set_interceptor(write_log_file);
++    }
++
++    bgb_pack = get_command_line_set("nzd_bgb");
++
++    if (direct_map.empty()) {
++      if (exit_after_match && game::is_new_client()) {
++        start_frontend_hook.create(game::relocate(COM_START_FRONTEND),
++                                   joiner_frontend_stub);
++        watch_for_client_active();
++      }
++      return;
++    }
++
++    if (!game::is_new_client()) {
++      print("direct_map needs the BlackOps3.exe this boiii build supports "
++            "(PE checksum 0x6531394)");
++      return;
++    }
++
++    start_frontend_hook.create(game::relocate(COM_START_FRONTEND),
++                               start_frontend_stub);
++    init_screenshot_hook.create(game::relocate(UI_INIT_FRONTEND_SCREENSHOT),
++                                init_screenshot_stub);
++    command::add("direct_launch_start", [] {
++      static bool done = false;
++      if (!done) {
++        done = true;
++        launch_after_mod_load();
++      }
++    });
++  }
++};
++} // namespace direct_launch
++
++REGISTER_COMPONENT(direct_launch::component)
+diff --git a/src/client/component/direct_launch.hpp b/src/client/component/direct_launch.hpp
+new file mode 100644
+index 00000000..210e24fd
+--- /dev/null
++++ b/src/client/component/direct_launch.hpp
+@@ -0,0 +1,11 @@
++#pragma once
++
++namespace direct_launch {
++// Called for every Com_Error; lets a direct launch recover from errors that
++// drop the player out of the match it started.
++void on_com_error(const char *message);
++
++// True for boot zones a direct Zombies launch never uses (multiplayer
++// specialists), so the loader can leave them out.
++bool skip_zone(const char *name);
++} // namespace direct_launch
+diff --git a/src/client/component/wmi_startup.cpp b/src/client/component/wmi_startup.cpp
+new file mode 100644
+index 00000000..949dd28d
+--- /dev/null
++++ b/src/client/component/wmi_startup.cpp
+@@ -0,0 +1,48 @@
++#include <std_include.hpp>
++
++#include <loader/component_loader.hpp>
++
++#include <utils/hook.hpp>
++
++namespace wmi_startup {
++namespace {
++// One of the game's static initializers connects to the BitLocker WMI
++// namespace before WinMain. For a normal user that connect blocks for about
++// five seconds and the game makes no use of the answer, so the namespace is
++// swapped for one that does not exist, which fails within milliseconds. The
++// rest of the startup (and the root\CIMV2 connect next to it) is untouched.
++constexpr std::wstring_view bitlocker_namespace =
++    L"\\\\.\\root\\CIMV2\\Security\\MicrosoftVolumeEncryption";
++constexpr const wchar_t *missing_namespace =
++    L"\\\\.\\root\\CIMV2\\Security\\boiii_skipped";
++
++utils::hook::detour sys_alloc_string_hook;
++
++BSTR WINAPI sys_alloc_string_stub(const OLECHAR *text) {
++  if (text && bitlocker_namespace == text) {
++    text = missing_namespace;
++  }
++
++  return sys_alloc_string_hook.invoke<BSTR>(text);
++}
++} // namespace
++
++struct component final : generic_component {
++#ifndef NDEBUG
++  std::string name() override { return "wmi_startup"; }
++#endif
++
++  void post_load() override {
++    const utils::nt::library oleaut32 = utils::nt::library::load("oleaut32.dll");
++    if (auto *const sys_alloc_string =
++            oleaut32.get_proc<void *>("SysAllocString")) {
++      sys_alloc_string_hook.create(sys_alloc_string, sys_alloc_string_stub);
++    }
++  }
++
++  // The static initializers have run by now.
++  void post_unpack() override { sys_alloc_string_hook.clear(); }
++};
++} // namespace wmi_startup
++
++REGISTER_COMPONENT(wmi_startup::component)

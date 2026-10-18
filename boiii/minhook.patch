@@ -1,0 +1,87 @@
+diff --git a/src/hook.c b/src/hook.c
+index 06f5696..f2c4d25 100644
+--- a/src/hook.c
++++ b/src/hook.c
+@@ -260,10 +260,82 @@ static VOID ProcessThreadIPs(HANDLE hThread, UINT pos, UINT action)
+ }
+ 
+ //-------------------------------------------------------------------------
++static BOOL AddThreadId(PFROZEN_THREADS pThreads, DWORD id)
++{
++    if (pThreads->pItems == NULL)
++    {
++        pThreads->capacity = INITIAL_THREAD_CAPACITY;
++        pThreads->pItems
++            = (LPDWORD)HeapAlloc(g_hHeap, 0, pThreads->capacity * sizeof(DWORD));
++        if (pThreads->pItems == NULL)
++            return FALSE;
++    }
++    else if (pThreads->size >= pThreads->capacity)
++    {
++        LPDWORD p = (LPDWORD)HeapReAlloc(
++            g_hHeap, 0, pThreads->pItems, pThreads->capacity * 2 * sizeof(DWORD));
++        if (p == NULL)
++            return FALSE;
++        pThreads->capacity *= 2;
++        pThreads->pItems = p;
++    }
++    pThreads->pItems[pThreads->size++] = id;
++    return TRUE;
++}
++
++// Walks only this process's threads. A Toolhelp snapshot covers every thread
++// on the system, which costs tens of milliseconds per hook on a busy machine.
++typedef LONG (NTAPI *NtGetNextThread_t)(HANDLE, HANDLE, ACCESS_MASK, ULONG, ULONG, PHANDLE);
++
++static BOOL EnumerateOwnThreads(PFROZEN_THREADS pThreads)
++{
++    static NtGetNextThread_t pNtGetNextThread = NULL;
++    static BOOL resolved = FALSE;
++    HANDLE hThread = NULL, hNext = NULL;
++    DWORD self = GetCurrentThreadId();
++    BOOL succeeded = TRUE;
++
++    if (!resolved)
++    {
++        pNtGetNextThread = (NtGetNextThread_t)GetProcAddress(
++            GetModuleHandleW(L"ntdll.dll"), "NtGetNextThread");
++        resolved = TRUE;
++    }
++    if (pNtGetNextThread == NULL)
++        return FALSE;
++
++    while (pNtGetNextThread(GetCurrentProcess(), hThread,
++                            THREAD_QUERY_LIMITED_INFORMATION, 0, 0, &hNext) >= 0)
++    {
++        DWORD id = GetThreadId(hNext);
++        if (hThread != NULL)
++            CloseHandle(hThread);
++        hThread = hNext;
++        if (id != 0 && id != self && !AddThreadId(pThreads, id))
++        {
++            succeeded = FALSE;
++            break;
++        }
++    }
++    if (hThread != NULL)
++        CloseHandle(hThread);
++
++    if (!succeeded && pThreads->pItems != NULL)
++    {
++        HeapFree(g_hHeap, 0, pThreads->pItems);
++        pThreads->pItems = NULL;
++        pThreads->size = 0;
++    }
++    return succeeded;
++}
++
+ static BOOL EnumerateThreads(PFROZEN_THREADS pThreads)
+ {
+     BOOL succeeded = FALSE;
+ 
++    if (EnumerateOwnThreads(pThreads))
++        return TRUE;
++
+     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+     if (hSnapshot != INVALID_HANDLE_VALUE)
+     {
